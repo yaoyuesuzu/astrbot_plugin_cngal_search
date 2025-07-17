@@ -3,7 +3,7 @@
 ## 使用说明
 
 - 该插件通过CnGal的官方API获取信息。
-- 若要使用早报功能，请务必安装插件：[cngal_moring_report](https://github.com/yaoyuesuzu/cngal_morning_report)
+- 若要使用早报功能，请务必安装插件：[cngal_moring_report]([https://github.com/yaoyuesuzu/cngal_morning_report](https://github.com/yaoyuesuzu/astrbot_plugin_cngal_morning_report))
 
 ## 使用教程
 
