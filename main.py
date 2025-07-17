@@ -9,12 +9,13 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from thefuzz import process
 import pytz
+from astrbot.api import logger
 
 @register(
     "cngal_search",
     "CnGal查询",
     "CnGal资料站多功能查询插件喵~ 输入 /cngal 查看帮助哦！如果要使用晨报功能，请先安装插件：https://github.com/yaoyuesuzu/cngal_morning_report",
-    "1.6.0",
+    "1.6.1",
     "https://github.com/yaoyuesuzu/cngal_search"
 )
 class CngalSearchPlugin(Star):
@@ -22,7 +23,6 @@ class CngalSearchPlugin(Star):
         super().__init__(context)
         self.base_url = "https://api.cngal.org"
         self.entry_page_url = "https://www.cngal.org/entries/index/"
-        self.logger = logging.getLogger("CngalSearchPlugin")
         self.cst_tz = pytz.timezone('Asia/Shanghai')
 
         # HTTP客户端设置
@@ -30,7 +30,7 @@ class CngalSearchPlugin(Star):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         }
         self.http_client = httpx.AsyncClient(
-            timeout=30.0, verify=False, follow_redirects=True, headers=headers
+            timeout=30.0, follow_redirects=True, headers=headers
         )
         
         # 缓存与并发控制
@@ -38,10 +38,19 @@ class CngalSearchPlugin(Star):
         self.cache_is_ready = False
         self._cache_update_lock = asyncio.Lock()
         
-        # 在插件加载时启动一次缓存更新
-        asyncio.create_task(self._update_name_cache())
+        task = asyncio.create_task(self._update_name_cache())
+        task.add_done_callback(self._handle_task_exception)
 
-        self.logger.info("CnGal智能查询插件已成功加载喵~")
+        logger.info("CnGal查询插件已成功加载。")
+
+    def _handle_task_exception(self, task: asyncio.Task) -> None:
+        """处理后台任务中未捕获的异常"""
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception(f"后台任务 '{task.get_name()}' 发生未处理的异常:")
 
     def _parse_iso_datetime(self, date_string: str) -> datetime | None:
         """解析ISO格式时间字符串"""
@@ -56,15 +65,16 @@ class CngalSearchPlugin(Star):
             aware_utc_dt = naive_dt.replace(tzinfo=pytz.utc)
             return aware_utc_dt
         except (ValueError, TypeError) as e:
-            self.logger.error(f"解析时间字符串 '{date_string}' 失败: {e}")
+            logger.error(f"解析时间字符串 '{date_string}' 失败: {e}")
             return None
 
     @filter.command("cngal", alias={"查询", "查"})
     async def cngal_command_handler(self, event: AstrMessageEvent):
-        """统一的指令处理器"""
+        """统一的指令处理器，用于分发不同的子命令和默认的搜索行为"""
         try:
             full_arg = event.get_plain_text().strip()
-        except Exception:
+        except AttributeError:
+            logger.warning("event对象没有get_plain_text方法，尝试使用message_str。")
             full_message = event.message_str.strip()
             parts = full_message.split(maxsplit=1)
             full_arg = parts[1] if len(parts) > 1 else ""
@@ -77,13 +87,13 @@ class CngalSearchPlugin(Star):
                 year = int(args[1]) if len(args) > 1 else None
                 month = int(args[2]) if len(args) > 2 else None
                 async for reply in self._get_monthly_games_logic(event, year, month): yield reply
-            except (ValueError, IndexError): yield event.plain_result("参数错了喵！用法: /cngal games [年份] [月份] ฅ'ω'ฅ")
+            except (ValueError, IndexError): yield event.plain_result("参数错了喵！用法: /cngal games [年份] [月份] ")
         elif command == "birthdays":
             try:
                 month = int(args[1]) if len(args) > 1 else None
                 day = int(args[2]) if len(args) > 2 else None
                 async for reply in self._get_role_birthdays_logic(event, month, day): yield reply
-            except (ValueError, IndexError): yield event.plain_result("参数错了喵！用法: /cngal birthdays [月份] [日期] ")
+            except (ValueError, IndexError): yield event.plain_result("参数错了喵！用法: /cngal birthdays [月份] [日期]")
         elif command == "timeline":
             async for reply in self._get_games_timeline_logic(event): yield reply
         elif full_arg:
@@ -119,9 +129,10 @@ class CngalSearchPlugin(Star):
                 link = f"{self.entry_page_url}{game.get('id')}"
                 if publish_time_utc:
                     publish_time_cst = publish_time_utc.astimezone(self.cst_tz)
-                    reply_lines.append(f"ฅ {game.get('name')} ({publish_time_cst.strftime('%Y-%m-%d')})\n  链接: {link}")
+                    reply_lines.append(f"- {game.get('name')} ({publish_time_cst.strftime('%Y-%m-%d')})\n  链接: {link}")
             yield event.plain_result("\n".join(reply_lines))
-        except Exception as e: self.logger.error(f"获取每月游戏失败: {e}"); yield event.plain_result("获取游戏信息失败了喵...呜...")
+        except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError) as e: 
+            logger.error(f"获取每月游戏失败: {e}"); yield event.plain_result("获取游戏信息失败了喵...呜...")
 
     async def _get_role_birthdays_logic(self, event: AstrMessageEvent, month: int = None, day: int = None):
         now = datetime.now(self.cst_tz); target_month = month or now.month; target_day = day or now.day
@@ -140,7 +151,8 @@ class CngalSearchPlugin(Star):
                 link = f"{self.entry_page_url}{role.get('id')}"
                 reply_lines.append(f"🎂 {role.get('name')} {birthday_text} (来自: 《{game_name}》)\n  链接: {link}")
             yield event.plain_result("\n".join(reply_lines))
-        except Exception as e: self.logger.error(f"获取角色生日失败: {e}"); yield event.plain_result("获取生日信息失败了喵...呜...")
+        except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError) as e: 
+            logger.error(f"获取角色生日失败: {e}"); yield event.plain_result("获取生日信息失败了喵...呜...")
 
     async def _get_games_timeline_logic(self, event: AstrMessageEvent):
         yield event.plain_result("正在努力加载未来的游戏喵~")
@@ -157,10 +169,11 @@ class CngalSearchPlugin(Star):
                 link = f"{self.entry_page_url}{entry.get('id')}"
                 reply_lines.append(f"- {entry.get('name')} ({display_time})\n  链接: {link}")
             yield event.plain_result("\n".join(reply_lines))
-        except Exception as e: self.logger.error(f"获取游戏时间轴失败: {e}"); yield event.plain_result("获取时间轴失败了喵...呜...")
+        except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError) as e: 
+            logger.error(f"获取游戏时间轴失败: {e}"); yield event.plain_result("获取时间轴失败了喵...呜...")
 
     async def _smart_search_logic(self, event: AstrMessageEvent, name: str):
-        yield event.plain_result(f"正在为主人查询「{name}」...请稍等喵~")
+        yield event.plain_result(f"正在查询“{name}”...")
         details = await self._get_details_by_name(name)
         if details:
             async for reply in self._reply_with_details(event, details): yield reply
@@ -187,13 +200,13 @@ class CngalSearchPlugin(Star):
     async def _update_name_cache(self):
         async with self._cache_update_lock:
             if self.cache_is_ready: return
-            self.logger.info("开始预热CnGal名称缓存...")
+            logger.info("开始预热CnGal名称缓存...")
             types_to_check = ["Game", "ProductionGroup", "Staff", "Role", "Periphery"]
             tasks = [self._get_all_names_by_type(t) for t in types_to_check]
             results = await asyncio.gather(*tasks)
             self.all_names_cache = list(set([name for name_list in results if name_list for name in name_list]))
             self.cache_is_ready = True
-            self.logger.info(f"名称缓存加载完毕，共加载 {len(self.all_names_cache)} 个条目。")
+            logger.info(f"名称缓存加载完毕，共加载 {len(self.all_names_cache)} 个条目。")
         
     async def _reply_with_details(self, event: AstrMessageEvent, details: dict):
         entry_type = details.get("type")
@@ -215,21 +228,23 @@ class CngalSearchPlugin(Star):
             response = await self.http_client.get(url)
             response.raise_for_status()
             return await response.aread()
-        except Exception: return None
+        except (httpx.RequestError, httpx.HTTPStatusError): return None
 
     async def _get_all_names_by_type(self, entry_type: str) -> list:
         url = f"{self.base_url}/api/entries/GetAllEntries/{entry_type}"
         try:
             response = await self.http_client.get(url, timeout=20)
-            return response.json() if response.status_code == 200 else []
-        except Exception: self.logger.error(f"获取'{entry_type}'列表时发生错误"); return []
+            response.raise_for_status()
+            return response.json()
+        except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError): 
+            logger.error(f"获取'{entry_type}'列表时发生错误"); return []
 
     async def _format_game_reply(self, details: dict) -> list:
         message_chain = []; image_url = details.get('mainPicture')
         if image_url:
             image_bytes = await self._get_image_bytes(image_url)
             if image_bytes: message_chain.append(Comp.Image.fromBytes(image_bytes))
-        reply_lines = [f"【游戏】{details.get('name', 'N/A')} ", f"别名: {details.get('anotherName', '无')}", f"简介: {details.get('briefIntroduction', '暂无')}"]
+        reply_lines = [f"【游戏】{details.get('name', 'N/A')}", f"别名: {details.get('anotherName', '无')}", f"简介: {details.get('briefIntroduction', '暂无')}"]
         publishers = [p.get('displayName') for p in details.get('publishers', [])]
         groups = [g.get('displayName') for g in details.get('productionGroups', [])]
         if publishers or groups: reply_lines.append("\n【制作与发行】");
@@ -246,7 +261,7 @@ class CngalSearchPlugin(Star):
         if image_url:
             image_bytes = await self._get_image_bytes(image_url)
             if image_bytes: message_chain.append(Comp.Image.fromBytes(image_bytes))
-        reply_lines = [f"【角色】{details.get('name', 'N/A')} "]
+        reply_lines = [f"【角色】{details.get('name', 'N/A')}"]
         cv = details.get("cv"); birthday = details.get("birthday")
         if cv or birthday: reply_lines.append("\n【基础信息】");
         if cv: reply_lines.append(f"CV: {cv}");
@@ -264,7 +279,7 @@ class CngalSearchPlugin(Star):
             if image_bytes: message_chain.append(Comp.Image.fromBytes(image_bytes))
         type_mapping = {"ProductionGroup": "制作组", "Staff": "Staff", "Periphery": "周边"}
         entity_type = details.get("type", "未知类型"); entity_type_text = type_mapping.get(entity_type, f"【{entity_type}】")
-        reply_lines = [f"【{entity_type_text}】{details.get('name', 'N/A')} "]
+        reply_lines = [f"【{entity_type_text}】{details.get('name', 'N/A')}"]
         intro = details.get("briefIntroduction")
         if intro: reply_lines.append(f"简介: {intro}")
         game_entries = details.get("staffGames", []) or details.get("roles", [])
@@ -298,17 +313,19 @@ class CngalSearchPlugin(Star):
         url = f"{self.base_url}/api/entries/GetId/{self._custom_base64_encode_name(name)}"
         try:
             response = await self.http_client.get(url)
-            return response.json() if response.status_code == 200 else None
-        except Exception: return None
+            response.raise_for_status()
+            return response.json()
+        except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError): return None
         
     async def _get_details_by_id(self, item_id: int):
         url = f"{self.base_url}/api/entries/GetEntryView/{item_id}"
         try:
             response = await self.http_client.get(url)
-            return response.json() if response.status_code == 200 else None
-        except Exception: return None
+            response.raise_for_status()
+            return response.json()
+        except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError): return None
 
     async def terminate(self):
         """插件终止时关闭HTTP客户端"""
         await self.http_client.aclose()
-        self.logger.info("CnGal智能查询插件已卸载。")
+        logger.info("CnGal查询插件已卸载，HTTP客户端已关闭。")
