@@ -1,6 +1,10 @@
-# CnGal 每日晨报 功能
+# CnGal查询 插件
 
-### 开发日志
-- 2025/07/16 从 CnGal查询 分离；
+## 使用说明
 
-该版本控制同 CnGal_search.
+- 该插件通过CnGal的官方API获取信息。
+- 若要使用早报功能，请务必安装插件：[cngal_moring_report](https://github.com/yaoyuesuzu/cngal_morning_report)
+
+## 使用教程
+
+- 输入 `/cngal` 获取帮助说明。

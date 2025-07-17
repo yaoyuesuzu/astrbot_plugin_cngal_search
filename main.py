@@ -1,87 +1,50 @@
 import httpx
+import base64
 import json
 import logging
 import asyncio
-import random
-import os
 from datetime import datetime
 import astrbot.api.message_components as Comp
-from astrbot.api.event import filter, AstrMessageEvent, MessageChain
+from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from thefuzz import process
 import pytz
 
 @register(
-    "cngal_morning_report",
-    "CnGal每日晨报",
-    "发送“/晨报”或“/早报”即可获取当日最新信息喵~",
+    "cngal_search",
+    "CnGal查询",
+    "CnGal资料站多功能查询插件喵~ 输入 /cngal 查看帮助哦！如果要使用晨报功能，请先安装插件：https://github.com/yaoyuesuzu/cngal_morning_report",
     "1.6.0",
-    "https://github.com/yaoyuesuzu/cngal_morning_report"
+    "https://github.com/yaoyuesuzu/cngal_search"
 )
-class CngalMorningReportPlugin(Star):
+class CngalSearchPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self.base_url = "https://api.cngal.org"
         self.entry_page_url = "https://www.cngal.org/entries/index/"
-        self.logger = logging.getLogger("CngalMorningReportPlugin")
+        self.logger = logging.getLogger("CngalSearchPlugin")
         self.cst_tz = pytz.timezone('Asia/Shanghai')
-        self.context = context
 
         # HTTP客户端设置
-        headers = { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36" }
-        self.http_client = httpx.AsyncClient(timeout=30.0, verify=False, follow_redirects=True, headers=headers)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        self.http_client = httpx.AsyncClient(
+            timeout=30.0, verify=False, follow_redirects=True, headers=headers
+        )
         
-        self.logger.info("CnGal每日晨报插件已成功加载 (关键词触发模式)喵~")
+        # 缓存与并发控制
+        self.all_names_cache = []
+        self.cache_is_ready = False
+        self._cache_update_lock = asyncio.Lock()
+        
+        # 在插件加载时启动一次缓存更新
+        asyncio.create_task(self._update_name_cache())
 
-    @filter.command("晨报", alias={"早报"})
-    async def handle_morning_report_keyword(self, event: AstrMessageEvent):
-        """处理晨报关键词，生成并发送报告"""
-        self.logger.info(f"在频道 {event.session_id} 检测到晨报指令，开始生成报告...")
-        yield event.plain_result("收到喵！正在为主人准备今天的晨报，请稍等哦~")
-        
-        report_chains = [chain async for chain in self.generate_morning_report()]
-        
-        for chain in report_chains:
-            await event.send(MessageChain(chain))
-            await asyncio.sleep(0.5) # 减慢发送速度，防止刷屏
-
-    async def generate_morning_report(self):
-        """产出晨报内容"""
-        now = datetime.now(self.cst_tz)
-        yield [Comp.Plain(f"主人早上好呀！今天是 {now.strftime('%Y年%m月%d日')}，可爱的我为您带来了今天的CnGal晨报☀️喵~")]
-
-        # 今日寿星
-        birthdays = await self._get_todays_birthdays(now.month, now.day)
-        if birthdays:
-            yield [Comp.Plain("\n🎂 今天是这些小可爱的生日哦~")]
-            for role_info in birthdays:
-                details = await self._get_details_by_id(role_info.get("id"))
-                if details:
-                    yield await self._format_role_reply(details)
-        else:
-            yield [Comp.Plain("\n🎂 今天似乎没有小可爱过生日呢~")]
-        
-        # 今日发售
-        releases = await self._get_todays_releases(now.year, now.month, now.day)
-        if releases:
-            yield [Comp.Plain("\n🎮 今天有新游戏发售哦！")]
-            for game_info in releases:
-                details = await self._get_details_by_id(game_info.get("id"))
-                if details:
-                    yield await self._format_game_reply(details)
-        else:
-            # 如果没有发售游戏，则推荐一款随机游戏
-            yield [Comp.Plain("\n🎮 今天没有新游戏发售呢，不过人家为主人推荐了一款游戏哦~")]
-            try:
-                game_names = await self._get_all_game_names()
-                if game_names:
-                    details = await self._get_details_by_name(random.choice(game_names))
-                    if details:
-                        yield await self._format_game_reply(details, is_recommend=True)
-            except Exception as e:
-                self.logger.error(f"生成无发售日备选推荐失败: {e}")
+        self.logger.info("CnGal智能查询插件已成功加载喵~")
 
     def _parse_iso_datetime(self, date_string: str) -> datetime | None:
+        """解析ISO格式时间字符串"""
         if not date_string: return None
         try:
             parts = date_string.replace('Z', '').split('.')
@@ -96,76 +59,156 @@ class CngalMorningReportPlugin(Star):
             self.logger.error(f"解析时间字符串 '{date_string}' 失败: {e}")
             return None
 
-    async def _get_todays_birthdays(self, month: int, day: int) -> list:
+    @filter.command("cngal", alias={"查询", "查"})
+    async def cngal_command_handler(self, event: AstrMessageEvent):
+        """统一的指令处理器"""
         try:
-            params = {"month": month, "day": day}
-            response = await self.http_client.get(f"{self.base_url}/api/entries/GetRoleBirthdaysByTime", params=params)
-            return response.json() if response.status_code == 200 else []
-        except Exception as e: self.logger.error(f"API _get_todays_birthdays 失败: {e}"); return []
+            full_arg = event.get_plain_text().strip()
+        except Exception:
+            full_message = event.message_str.strip()
+            parts = full_message.split(maxsplit=1)
+            full_arg = parts[1] if len(parts) > 1 else ""
 
-    async def _get_todays_releases(self, year: int, month: int, day: int) -> list:
-        try:
-            params = {"year": year, "month": month}
-            response = await self.http_client.get(f"{self.base_url}/api/entries/GetPublishGamesByTime", params=params)
-            if response.status_code != 200: return []
-            
-            today_games = []
-            now_date = datetime.now(self.cst_tz).date()
-            for game in response.json():
-                publish_time_utc = self._parse_iso_datetime(game.get("publishTime"))
-                if publish_time_utc and publish_time_utc.astimezone(self.cst_tz).date() == now_date:
-                    today_games.append(game)
-            return today_games
-        except Exception as e: self.logger.error(f"API _get_todays_releases 失败: {e}"); return []
-    
-    async def _get_all_game_names(self) -> list:
-        url = f"{self.base_url}/api/entries/GetAllEntries/Game"
-        try:
-            response = await self.http_client.get(url, timeout=20)
-            return response.json() if response.status_code == 200 else []
-        except Exception: self.logger.error(f"获取'Game'列表时发生错误"); return []
+        args = full_arg.split()
+        command = args[0].lower() if args else ""
 
-    async def _format_game_reply(self, details: dict, is_recommend: bool = False) -> list:
-        message_chain = []
-        image_bytes = await self._get_image_bytes(details.get('mainPicture'))
-        if image_bytes: message_chain.append(Comp.Image.fromBytes(image_bytes))
-        
-        game_title = details.get('name', 'N/A')
-        cngal_link = f"{self.entry_page_url}{details.get('id')}"
-        
-        text_lines = []
-        if is_recommend:
-            text_lines.append(f"【人家猜主人会喜欢这个喵~】\n《{game_title}》")
+        if command == "games":
+            try:
+                year = int(args[1]) if len(args) > 1 else None
+                month = int(args[2]) if len(args) > 2 else None
+                async for reply in self._get_monthly_games_logic(event, year, month): yield reply
+            except (ValueError, IndexError): yield event.plain_result("参数错了喵！用法: /cngal games [年份] [月份] ฅ'ω'ฅ")
+        elif command == "birthdays":
+            try:
+                month = int(args[1]) if len(args) > 1 else None
+                day = int(args[2]) if len(args) > 2 else None
+                async for reply in self._get_role_birthdays_logic(event, month, day): yield reply
+            except (ValueError, IndexError): yield event.plain_result("参数错了喵！用法: /cngal birthdays [月份] [日期] ")
+        elif command == "timeline":
+            async for reply in self._get_games_timeline_logic(event): yield reply
+        elif full_arg:
+            async for reply in self._smart_search_logic(event, name=full_arg):
+                yield reply
         else:
-             text_lines.append(f"《{game_title}》")
-        
-        text_lines.append(f"简介: {details.get('briefIntroduction', '暂无')[:70]}...")
-        text_lines.append(f"详情页: {cngal_link}")
-        text_lines.append(f"详细情报请通过指令“ /cngal {game_title} ” 查询喵~")
-        
-        message_chain.append(Comp.Plain("\n".join(text_lines)))
-        return message_chain
+            help_text = (
+                "主人，需要帮助吗？喵~ 这是我的用法哦：\n"
+                "1. 查询条目: `/cngal <名称>`\n"
+                "   (人家什么都能查哦！游戏、角色、Staff...)\n\n"
+                "2. 本月新游: `/cngal games`\n"
+                "   查询指定月份: `/cngal games 2025 7`\n\n"
+                "3. 今日寿星: `/cngal birthdays`\n"
+                "   查询指定日期: `/cngal birthdays 7 31`\n\n"
+                "4. 发售前瞻: `/cngal timeline`\n\n"
+                "想要可爱的每日晨报吗？请发送 “ /晨报 ” 或 “ /早报 ” 就可以啦！\n\n"
+                "主人也可以在群内@我 或者 加我为好友 聊天哦！\n"
+                "希望能给主人带来快乐喵~"
+            )
+            yield event.plain_result(help_text)
 
-    async def _format_role_reply(self, details: dict) -> list:
-        message_chain = []
-        image_url = details.get('standingPainting') or details.get('mainPicture')
-        image_bytes = await self._get_image_bytes(image_url)
-        if image_bytes: message_chain.append(Comp.Image.fromBytes(image_bytes))
-        
-        role_name = details.get('name', 'N/A')
-        cngal_link = f"{self.entry_page_url}{details.get('id')}"
-        game_name = "未知"
-        if details.get("addInfors") and details["addInfors"][0].get("contents"):
-            game_name = details["addInfors"][0]["contents"][0].get("displayName", "未知")
+    async def _get_monthly_games_logic(self, event: AstrMessageEvent, year: int = None, month: int = None):
+        now = datetime.now(self.cst_tz); target_year = year or now.year; target_month = month or now.month
+        yield event.plain_result(f"正在为主人查询 {target_year}年{target_month}月 的游戏...")
+        try:
+            params = {"year": target_year, "month": target_month}
+            response = await self.http_client.get(f"{self.base_url}/api/entries/GetPublishGamesByTime", params=params)
+            response.raise_for_status(); games = response.json()
+            if not games: yield event.plain_result(f"呜...{target_year}年{target_month}月 暂时没有新游戏的情报喵~"); return
+            reply_lines = [f"喵~ 这是{target_year}年{target_month}月要发售的游戏哦："]
+            for game in games:
+                publish_time_utc = self._parse_iso_datetime(game.get('publishTime'))
+                link = f"{self.entry_page_url}{game.get('id')}"
+                if publish_time_utc:
+                    publish_time_cst = publish_time_utc.astimezone(self.cst_tz)
+                    reply_lines.append(f"ฅ {game.get('name')} ({publish_time_cst.strftime('%Y-%m-%d')})\n  链接: {link}")
+            yield event.plain_result("\n".join(reply_lines))
+        except Exception as e: self.logger.error(f"获取每月游戏失败: {e}"); yield event.plain_result("获取游戏信息失败了喵...呜...")
 
-        text_lines = [f"🎂 {role_name} 🎂"]
-        # text_lines.append(f"来自:《{game_name}》") # 好像目前用不了，但我也不打算修了
-        text_lines.append(f"详情页: {cngal_link}")
-        text_lines.append(f"详细情报请通过指令“ /cngal {role_name} ” 查询喵~")
+    async def _get_role_birthdays_logic(self, event: AstrMessageEvent, month: int = None, day: int = None):
+        now = datetime.now(self.cst_tz); target_month = month or now.month; target_day = day or now.day
+        yield event.plain_result(f"正在为主人寻找 {target_month}月{target_day}日 的寿星...")
+        try:
+            params = {"month": target_month, "day": day}
+            response = await self.http_client.get(f"{self.base_url}/api/entries/GetRoleBirthdaysByTime", params=params)
+            response.raise_for_status(); roles = response.json()
+            if not roles: yield event.plain_result(f"{target_month}月{target_day}日 没有小可爱过生日哦~"); return
+            reply_lines = [f"喵~ {target_month}月{target_day}日 的寿星是他们哦："]
+            for role in roles:
+                birthday_utc = self._parse_iso_datetime(role.get('brithday') or role.get('birthday', ''))
+                birthday_text = f"({birthday_utc.astimezone(self.cst_tz).strftime('%m-%d')})" if birthday_utc else ""
+                game_name = "未知作品"; add_infors = role.get("addInfors", [])
+                if add_infors and add_infors[0].get("contents"): game_name = add_infors[0]["contents"][0].get("displayName", "未知作品")
+                link = f"{self.entry_page_url}{role.get('id')}"
+                reply_lines.append(f"🎂 {role.get('name')} {birthday_text} (来自: 《{game_name}》)\n  链接: {link}")
+            yield event.plain_result("\n".join(reply_lines))
+        except Exception as e: self.logger.error(f"获取角色生日失败: {e}"); yield event.plain_result("获取生日信息失败了喵...呜...")
+
+    async def _get_games_timeline_logic(self, event: AstrMessageEvent):
+        yield event.plain_result("正在努力加载未来的游戏喵~")
+        try:
+            params = {"afterTime": int(datetime.now().timestamp() * 1000)}
+            response = await self.http_client.get(f"{self.base_url}/api/entries/GetPublishGamesTimeline", params=params)
+            response.raise_for_status(); timeline = response.json()
+            if not timeline: yield event.plain_result("未来一片混沌，看不到新游戏呢喵~"); return
+            reply_lines = ["【未来游戏发售时间轴】"]
+            for entry in timeline[:20]:
+                publish_time_utc = self._parse_iso_datetime(entry.get('publishTime'))
+                time_note = entry.get('publishTimeNote', '')
+                display_time = time_note or (publish_time_utc.astimezone(self.cst_tz).strftime('%Y-%m-%d') if publish_time_utc else '日期未知')
+                link = f"{self.entry_page_url}{entry.get('id')}"
+                reply_lines.append(f"- {entry.get('name')} ({display_time})\n  链接: {link}")
+            yield event.plain_result("\n".join(reply_lines))
+        except Exception as e: self.logger.error(f"获取游戏时间轴失败: {e}"); yield event.plain_result("获取时间轴失败了喵...呜...")
+
+    async def _smart_search_logic(self, event: AstrMessageEvent, name: str):
+        yield event.plain_result(f"正在为主人查询「{name}」...请稍等喵~")
+        details = await self._get_details_by_name(name)
+        if details:
+            async for reply in self._reply_with_details(event, details): yield reply
+            return
+        if not self.cache_is_ready:
+            yield event.plain_result("首次提供建议，人家正在努力加载数据，请主人稍等一下下喵...")
+            await self._update_name_cache()
+            if not self.cache_is_ready: yield event.plain_result("呜呜...加载建议列表失败了喵..."); return
+        top_matches = process.extract(name, self.all_names_cache, limit=5)
+        if not top_matches or top_matches[0][1] < 75:
+            yield event.plain_result(f"呜...找不到「{name}」的任何线索喵..."); return
+        best_match_name, best_score = top_matches[0]
+        if best_score > 85:
+            yield event.plain_result(f"主人是不是要找这个呀？【{best_match_name}】喵~")
+            corrected_details = await self._get_details_by_name(best_match_name)
+            if corrected_details:
+                async for reply in self._reply_with_details(event, corrected_details): yield reply
+            else: yield event.plain_result(f"呜...尝试查询【{best_match_name}】失败了喵...")
+        else:
+            reply_lines = [f"人家找到了这些相似的，主人看看嘛~"]
+            reply_lines.extend([f"- {match[0]} (相似度: {match[1]}%)" for match in top_matches])
+            yield event.plain_result("\n".join(reply_lines))
+
+    async def _update_name_cache(self):
+        async with self._cache_update_lock:
+            if self.cache_is_ready: return
+            self.logger.info("开始预热CnGal名称缓存...")
+            types_to_check = ["Game", "ProductionGroup", "Staff", "Role", "Periphery"]
+            tasks = [self._get_all_names_by_type(t) for t in types_to_check]
+            results = await asyncio.gather(*tasks)
+            self.all_names_cache = list(set([name for name_list in results if name_list for name in name_list]))
+            self.cache_is_ready = True
+            self.logger.info(f"名称缓存加载完毕，共加载 {len(self.all_names_cache)} 个条目。")
         
-        message_chain.append(Comp.Plain("\n".join(text_lines)))
-        return message_chain
-        
+    async def _reply_with_details(self, event: AstrMessageEvent, details: dict):
+        entry_type = details.get("type")
+        formatter_map = {
+            "Game": self._format_game_reply, "Role": self._format_role_reply,
+            "ProductionGroup": self._format_common_reply, "Staff": self._format_common_reply,
+            "Periphery": self._format_common_reply
+        }
+        formatter = formatter_map.get(entry_type)
+        if formatter:
+            message_chain_list = await formatter(details)
+            yield event.chain_result(message_chain_list)
+        else:
+            yield event.plain_result(f"找到了条目“{details.get('name')}”，但人家还不知道怎么展示它呢喵...")
+            
     async def _get_image_bytes(self, url: str) -> bytes | None:
         if not url: return None
         try:
@@ -174,6 +217,75 @@ class CngalMorningReportPlugin(Star):
             return await response.aread()
         except Exception: return None
 
+    async def _get_all_names_by_type(self, entry_type: str) -> list:
+        url = f"{self.base_url}/api/entries/GetAllEntries/{entry_type}"
+        try:
+            response = await self.http_client.get(url, timeout=20)
+            return response.json() if response.status_code == 200 else []
+        except Exception: self.logger.error(f"获取'{entry_type}'列表时发生错误"); return []
+
+    async def _format_game_reply(self, details: dict) -> list:
+        message_chain = []; image_url = details.get('mainPicture')
+        if image_url:
+            image_bytes = await self._get_image_bytes(image_url)
+            if image_bytes: message_chain.append(Comp.Image.fromBytes(image_bytes))
+        reply_lines = [f"【游戏】{details.get('name', 'N/A')} ", f"别名: {details.get('anotherName', '无')}", f"简介: {details.get('briefIntroduction', '暂无')}"]
+        publishers = [p.get('displayName') for p in details.get('publishers', [])]
+        groups = [g.get('displayName') for g in details.get('productionGroups', [])]
+        if publishers or groups: reply_lines.append("\n【制作与发行】");
+        if groups: reply_lines.append(f"制作组: {', '.join(groups)}");
+        if publishers: reply_lines.append(f"发行商: {', '.join(publishers)}")
+        tags = [t.get('name') for t in details.get('tags', [])]
+        if tags: reply_lines.append("\n【标签】"); reply_lines.append('、'.join(tags))
+        reply_lines.append(f"\n详情页链接: {self.entry_page_url}{details.get('id')}")
+        message_chain.append(Comp.Plain(text="\n".join(reply_lines)))
+        return message_chain
+
+    async def _format_role_reply(self, details: dict) -> list:
+        message_chain = []; image_url = details.get('standingPainting') or details.get('mainPicture')
+        if image_url:
+            image_bytes = await self._get_image_bytes(image_url)
+            if image_bytes: message_chain.append(Comp.Image.fromBytes(image_bytes))
+        reply_lines = [f"【角色】{details.get('name', 'N/A')} "]
+        cv = details.get("cv"); birthday = details.get("birthday")
+        if cv or birthday: reply_lines.append("\n【基础信息】");
+        if cv: reply_lines.append(f"CV: {cv}");
+        if birthday: reply_lines.append(f"生日: {birthday}")
+        intro = details.get("briefIntroduction")
+        if intro: reply_lines.append("\n【简介】"); reply_lines.append(intro)
+        reply_lines.append(f"\n详情页链接: {self.entry_page_url}{details.get('id')}")
+        message_chain.append(Comp.Plain(text="\n".join(reply_lines)))
+        return message_chain
+
+    async def _format_common_reply(self, details: dict) -> list:
+        message_chain = []; image_url = details.get("mainPicture") or details.get("thumbnail")
+        if image_url:
+            image_bytes = await self._get_image_bytes(image_url)
+            if image_bytes: message_chain.append(Comp.Image.fromBytes(image_bytes))
+        type_mapping = {"ProductionGroup": "制作组", "Staff": "Staff", "Periphery": "周边"}
+        entity_type = details.get("type", "未知类型"); entity_type_text = type_mapping.get(entity_type, f"【{entity_type}】")
+        reply_lines = [f"【{entity_type_text}】{details.get('name', 'N/A')} "]
+        intro = details.get("briefIntroduction")
+        if intro: reply_lines.append(f"简介: {intro}")
+        game_entries = details.get("staffGames", []) or details.get("roles", [])
+        if game_entries:
+            reply_lines.append("\n【相关作品】")
+            for game in game_entries[:5]:
+                game_name = game.get("name", "未知作品"); positions = []
+                for info in game.get("addInfors", []):
+                    if info.get("modifier") == "职位": positions = [pos.get("displayName") for pos in info.get("contents", [])]
+                if positions: reply_lines.append(f"- 《{game_name}》 ({', '.join(positions)})")
+                else: reply_lines.append(f"- 《{game_name}》")
+        relevances = details.get("entryRelevances", [])
+        if relevances:
+            reply_lines.append("\n【关联词条】")
+            for relevance in relevances[:5]:
+                relevance_name = relevance.get("name", "未知词条"); relevance_type = relevance.get("type", "未知类型")
+                reply_lines.append(f"- [{relevance_type}] {relevance_name}")
+        reply_lines.append(f"\n详情页链接: {self.entry_page_url}{details.get('id')}")
+        message_chain.append(Comp.Plain(text="\n".join(reply_lines)))
+        return message_chain
+        
     async def _get_details_by_name(self, name: str):
         item_id = await self._get_id_by_name(name)
         if item_id is None: return None
@@ -197,5 +309,6 @@ class CngalMorningReportPlugin(Star):
         except Exception: return None
 
     async def terminate(self):
+        """插件终止时关闭HTTP客户端"""
         await self.http_client.aclose()
-        self.logger.info("CnGal每日晨报插件已卸载。")
+        self.logger.info("CnGal智能查询插件已卸载。")
