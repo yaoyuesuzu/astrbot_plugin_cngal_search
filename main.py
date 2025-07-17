@@ -16,7 +16,7 @@ from astrbot.api import logger
     "CnGal查询",
     "CnGal资料站多功能查询插件喵~ 输入 /cngal 查看帮助哦！如果要使用晨报功能，请先安装插件：https://github.com/yaoyuesuzu/cngal_morning_report",
     "1.6.1",
-    "https://github.com/yaoyuesuzu/cngal_search"
+    "https://github.com/yaoyuesuzu/astrbot_plugin_cngal_search"
 )
 class CngalSearchPlugin(Star):
     def __init__(self, context: Context):
